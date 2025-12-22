@@ -94,8 +94,8 @@ def load_model(model_path: str):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, quantization_config=quant_config, device_map="auto"
+    model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto"
+        #model_path, quantization_config=quant_config, device_map="auto"
     )
     return model, tokenizer
 

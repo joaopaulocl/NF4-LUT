@@ -37,3 +37,30 @@ python scripts/download_hf_models.py meta-llama/Llama-2-7b-hf --cache-dir ./mode
 ```
 
 You can pass multiple model IDs, add `--revision` to pin a commit/tag, and filter files with `--allow-pattern` / `--ignore-pattern`.
+
+
+## WikiText-2 perplexity
+
+Estimate perplexity on WikiText-2 with your NF4 checkpoint via:
+
+```
+python scripts/run_wikitext2_perplexity.py --model <model-or-path>
+```
+
+Flags worth tweaking:
+
+- `--max-length` / `--stride` control the evaluation sliding window.
+- `--max-texts` can cap the number of documents for quicker runs.
+
+
+## Commonsense benchmarks
+
+Evaluate PIQA, SIQA, HellaSwag, WinoGrande, ARC (easy/challenge), OpenBookQA, and CommonsenseQA with:
+
+```
+python scripts/run_benchmark_eval.py --model <model-or-path>
+```
+
+Use `--tasks` to subset (e.g. `--tasks piqa hellaswag`) and `--max-samples` for quicker sanity checks. The script scores each option by log-probability of the answer letter appended after the prompt.
+
+python scripts/run_benchmark_eval.py --model meta-llama/Llama-2-7b-hf --tasks piqa  --max-samples

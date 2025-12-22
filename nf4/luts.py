@@ -9,6 +9,7 @@ from .constants import NF4_POS_MAG
 def build_5bit_acc_lut(values: np.ndarray) -> dict[str, float]:
     """Returns a 5-bit LUT for keeping precise accumulator values."""
     lut = {}
+    print(values)
     for i, val in enumerate(values):
         lut[f"{i:05b}"] = val
     return lut
@@ -68,7 +69,7 @@ def empirical_lloyd_lut(samples: np.ndarray, bits: int = 3) -> dict[int, float]:
     c, _ = lloyd_max_empirical(samples, K=K)
 
     c = c / np.max(np.abs(c))
-    codebook = np.round(c, 4)
+    codebook = np.round(c, 3)
 
     lut = {}
     for i in range(2**bits):
@@ -82,13 +83,20 @@ def closest_value(x: float, lut: dict) -> float:
     idx = np.argmin(np.abs(values - x))
     return values[idx]
 
+def build_nf4_lut(magnitudes: np.ndarray) -> dict[int, float]:
+    result = {}
+    for i in range(0,magnitudes.shape[0]):
+        result[i] = magnitudes[i]
+    return result
 
 def build_nf4_mul_lut(magnitudes: np.ndarray, lut: dict) -> dict[int, float]:
-    """Builds a 6-bit NF4 multiplication LUT for magnitude-only inputs."""
+    """Builds a 6-bit NF4 multiplication LUT."""
     result = {}
-    for i in range(8):
-        for j in range(8):
-            key = (i << 3) | j
+    len = magnitudes.shape[0]
+    shift = np.log2(len).astype(int) 
+    for i in range(len):
+        for j in range(len):
+            key = (i << shift) | j
             result[key] = closest_value(magnitudes[i] * magnitudes[j], lut)
     return result
 
@@ -113,6 +121,52 @@ def nf4_array_multiply(a: np.ndarray, b: np.ndarray, lut: dict[int, float]) -> n
     mag_prod = np.vectorize(lut.get, otypes=[float])(keys)
 
     return np.where(out_sign, -mag_prod, mag_prod)
+
+
+def nf4_matmul(A: np.ndarray, B: np.ndarray, lut: dict[int, float]) -> np.ndarray:
+    """
+    Matrix multiplication C = A @ B using NF4 × NF4 multiplication via LUT.
+
+    A: (M, K) uint8 NF4-encoded
+    B: (K, N) uint8 NF4-encoded
+    Returns:
+        C: (M, N) float
+    """
+    A = np.asarray(A, dtype=np.uint8)
+    B = np.asarray(B, dtype=np.uint8)
+
+    assert A.ndim == 2 and B.ndim == 2
+    assert A.shape[1] == B.shape[0]
+
+    M, K = A.shape
+    _, N = B.shape
+
+    C = np.zeros((M, N), dtype=float)
+
+    # Compute C[i, j] = sum_k A[i, k] * B[k, j]
+    for k in range(K):
+        # Broadcast:
+        # A[:, k] -> (M, 1)
+        # B[k, :] -> (1, N)
+        prod = nf4_array_multiply(
+            A[:, k][:, None],
+            B[k, :][None, :],
+            lut
+        )
+        C += prod
+
+    return C
+
+def nf4_matmul_vectorized(A: np.ndarray, B: np.ndarray, lut: dict[int, float]) -> np.ndarray:
+    A = np.asarray(A, dtype=np.uint8)
+    B = np.asarray(B, dtype=np.uint8)
+
+    # Shapes: (M, K, 1) and (1, K, N)
+    A_exp = A[:, :, None]
+    B_exp = B.T[None, :, :]  # transpose so K aligns
+
+    prod = nf4_array_multiply(A_exp, B_exp, lut)
+    return prod.sum(axis=1)
 
 
 def default_nf4_mul_lut(bits: int = 3) -> dict[int, float]:

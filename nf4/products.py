@@ -19,5 +19,6 @@ def flatten_products(products: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.n
     """
     flattened = products.flatten()
     unique_vals = np.unique(flattened)
-    unique_pos = unique_vals[unique_vals > 0]
+    unique_pos = unique_vals[unique_vals >= 0]
     return flattened, unique_vals, unique_pos
+
