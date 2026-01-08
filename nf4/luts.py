@@ -9,7 +9,6 @@ from .constants import NF4_POS_MAG
 def build_5bit_acc_lut(values: np.ndarray) -> dict[str, float]:
     """Returns a 5-bit LUT for keeping precise accumulator values."""
     lut = {}
-    print(values)
     for i, val in enumerate(values):
         lut[f"{i:05b}"] = val
     return lut
@@ -141,7 +140,7 @@ def nf4_matmul(A: np.ndarray, B: np.ndarray, lut: dict[int, float]) -> np.ndarra
     M, K = A.shape
     _, N = B.shape
 
-    C = np.zeros((M, N), dtype=float)
+    C = np.zeros((M, N), dtype=np.float64)
 
     # Compute C[i, j] = sum_k A[i, k] * B[k, j]
     for k in range(K):

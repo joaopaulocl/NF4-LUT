@@ -83,7 +83,7 @@ def main() -> None:
     lut_empirical = empirical_lloyd_lut(flattened, bits=3)
 
     #print("Empirical LUT values:", lut_empirical)
-    mul_lut = build_nf4_mul_lut(NF4_POS_MAG, lut_empirical)
+    mul_lut = build_nf4_mul_lut(NF4_POS_MAG, lut_5b)
 
     mul_lut_neg = build_nf4_mul_lut(NF4_MAG, lut_empirical)
 

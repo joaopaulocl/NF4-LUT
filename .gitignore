@@ -209,3 +209,5 @@ __marimo__/
 
 build/
 models/
+*.txt
+bitsandbytes/
