@@ -79,7 +79,7 @@ def main() -> None:
     lut_nf4 = build_nf4_lut(NF4_MAG)
     lut_8b = build_mul_lut(flattened, bits=8) 
     lut_gaussian = gaussian_max_lloyd_lut(flattened)
-    lut_empirical = empirical_lloyd_lut(flattened, bits=4)
+    lut_empirical = empirical_lloyd_lut(flattened, bits=3)
 
     #print("Empirical LUT values:", lut_empirical)
     mul_lut = build_nf4_mul_lut(NF4_MAG, lut_8b)
@@ -114,8 +114,8 @@ def main() -> None:
     print(matmul_result_2.flatten()[0:10])
     print(C_ref.flatten()[0:10])
 
-    print("NF4 matmul result (4x4):\n", matmul_result_2)
-    print("Reference matmul result (4x4):\n", C_ref)
+    #print("NF4 matmul result (4x4):\n", matmul_result_2)
+    #print("Reference matmul result (4x4):\n", C_ref)
     assert np.allclose(matmul_result_2, C_ref, 1e-1), "NF4 matmul does not match reference!"
 
 if __name__ == "__main__":

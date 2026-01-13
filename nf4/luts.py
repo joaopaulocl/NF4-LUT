@@ -64,15 +64,16 @@ def empirical_lloyd_lut(samples: np.ndarray, bits: int = 3) -> dict[int, float]:
     Trains a Lloyd–Max quantizer on empirical samples and returns a LUT for
     the selected output levels.
     """
-    K = 2 * 2**bits
+    K = 2**bits
     c, _ = lloyd_max_empirical(samples, K=K)
 
     c = c / np.max(np.abs(c))
-    codebook = np.round(c, 3)
+    codebook = c
 
     lut = {}
     for i in range(2**bits):
-        lut[i] = codebook[i + 2**bits]
+        lut[i] = codebook[i]
+
     return lut
 
 

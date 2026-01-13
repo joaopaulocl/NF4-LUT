@@ -417,6 +417,9 @@ def evaluate_task(
     print(f"{name}: {accuracy * 100:.2f}% ({correct}/{total})")
     return accuracy
 
+from bitsandbytes.functional import set_nf4_ewm_lut
+# default is 8
+set_nf4_ewm_lut(5)  # or 4, 5
 
 def main() -> None:
     parser = build_parser()
