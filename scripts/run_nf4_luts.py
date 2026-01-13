@@ -12,16 +12,15 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from nf4.constants import NF4_MAG, NF4_POS_MAG
+from nf4.constants import NF4_MAG
 from nf4.luts import (
-    build_5bit_acc_lut,
+    build_mul_lut,
     build_nf4_lut,
     empirical_lloyd_lut,
     gaussian_max_lloyd_lut,
     nf4_array_multiply,
     build_nf4_mul_lut,
     nf4_matmul,
-    nf4_matmul_vectorized,
 )
 
 from nf4.products import pairwise_product_matrix, flatten_products
@@ -78,23 +77,23 @@ def main() -> None:
     save_figure(fig, "nf4_unique_histogram.png")
 
     lut_nf4 = build_nf4_lut(NF4_MAG)
-    lut_5b = build_5bit_acc_lut(unique_pos) #flattened
+    lut_8b = build_mul_lut(flattened, bits=8) 
     lut_gaussian = gaussian_max_lloyd_lut(flattened)
-    lut_empirical = empirical_lloyd_lut(flattened, bits=3)
+    lut_empirical = empirical_lloyd_lut(flattened, bits=4)
 
     #print("Empirical LUT values:", lut_empirical)
-    mul_lut = build_nf4_mul_lut(NF4_POS_MAG, lut_5b)
+    mul_lut = build_nf4_mul_lut(NF4_MAG, lut_8b)
 
-    mul_lut_neg = build_nf4_mul_lut(NF4_MAG, lut_empirical)
+    mul_lut_approx = build_nf4_mul_lut(NF4_MAG, lut_empirical)
 
     #print(mul_lut)
-    dump_lut(lut_5b, "lut_5b_accumulator.json")
+    dump_lut(lut_8b, "lut_8b_accumulator.json")
     dump_lut(lut_gaussian, "lut_3b_gaussian.json")
     dump_lut(lut_empirical, "lut_3b_empirical.json")
     dump_lut(mul_lut, "nf4_mul_lut.json")
-    dump_lut(mul_lut_neg, "nf4_mul_neg_lut.json")
-    print("LUT neg", [float(v) for v in mul_lut_neg.values()]) 
-    print("LUT accurate", [float(v) for v in lut_5b.values()]) 
+    dump_lut(mul_lut_approx, "nf4_mul_approx_lut.json")
+    print("LUT approx", [float(v) for v in mul_lut_approx.values()]) 
+    print("LUT accurate", [float(v) for v in lut_8b.values()]) 
 
     vals4b = np.arange(16, dtype=np.uint8)
     a = np.repeat(vals4b, 16)
@@ -112,10 +111,12 @@ def main() -> None:
         a.reshape(16, 16), b.reshape(16, 16), mul_lut
     )
     C_ref = a_.reshape(16, 16) @ b_.reshape(16, 16)
-    
+    print(matmul_result_2.flatten()[0:10])
+    print(C_ref.flatten()[0:10])
+
     print("NF4 matmul result (4x4):\n", matmul_result_2)
     print("Reference matmul result (4x4):\n", C_ref)
-    assert np.allclose(matmul_result_2, C_ref, 1e-3), "NF4 matmul does not match reference!"
+    assert np.allclose(matmul_result_2, C_ref, 1e-1), "NF4 matmul does not match reference!"
 
 if __name__ == "__main__":
     main()

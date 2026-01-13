@@ -9,7 +9,13 @@ def pairwise_product_matrix(magnitudes: np.ndarray | None = None) -> np.ndarray:
     """
     if magnitudes is None:
         magnitudes = NF4_MAG
-    return np.outer(magnitudes, magnitudes)
+    result = []
+    len = magnitudes.shape[0]
+    for i in range(len):
+        for j in range(len):
+            result.append(magnitudes[i] * magnitudes[j])    
+
+    return np.array(result).reshape((len, len))
 
 
 def flatten_products(products: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -19,6 +25,6 @@ def flatten_products(products: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.n
     """
     flattened = products.flatten()
     unique_vals = np.unique(flattened)
-    unique_pos = unique_vals[unique_vals >= 0]
+    unique_pos = np.unique(np.abs(unique_vals)) 
     return flattened, unique_vals, unique_pos
 

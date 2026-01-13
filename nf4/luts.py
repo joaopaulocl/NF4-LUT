@@ -3,14 +3,14 @@ from __future__ import annotations
 import numpy as np
 import scipy.stats as stats
 
-from .constants import NF4_POS_MAG
+from .constants import NF4_MAG
 
 
-def build_5bit_acc_lut(values: np.ndarray) -> dict[str, float]:
+def build_mul_lut(values: np.ndarray, bits: int = 5) -> dict[str, float]:
     """Returns a 5-bit LUT for keeping precise accumulator values."""
     lut = {}
     for i, val in enumerate(values):
-        lut[f"{i:05b}"] = val
+        lut[f"{i:0{bits}b}"] = val
     return lut
 
 
@@ -84,7 +84,7 @@ def closest_value(x: float, lut: dict) -> float:
 
 def build_nf4_lut(magnitudes: np.ndarray) -> dict[int, float]:
     result = {}
-    for i in range(0,magnitudes.shape[0]):
+    for i in range(0, magnitudes.shape[0]):
         result[i] = magnitudes[i]
     return result
 
@@ -108,19 +108,14 @@ def nf4_array_multiply(a: np.ndarray, b: np.ndarray, lut: dict[int, float]) -> n
     a = np.asarray(a, dtype=np.uint8)
     b = np.asarray(b, dtype=np.uint8)
 
-    sign_a = (a >> 3) & 0b1
-    sign_b = (b >> 3) & 0b1
+    idx_a = a & 0b1111 
+    idx_b = b & 0b1111
 
-    idx_a = a & 0b111
-    idx_b = b & 0b111
-
-    out_sign = sign_a ^ sign_b
-    keys = (idx_a << 3) | idx_b
+    keys = (idx_a << 4) | idx_b
 
     mag_prod = np.vectorize(lut.get, otypes=[float])(keys)
 
-    return np.where(out_sign, -mag_prod, mag_prod)
-
+    return mag_prod
 
 def nf4_matmul(A: np.ndarray, B: np.ndarray, lut: dict[int, float]) -> np.ndarray:
     """
@@ -167,7 +162,3 @@ def nf4_matmul_vectorized(A: np.ndarray, B: np.ndarray, lut: dict[int, float]) -
     prod = nf4_array_multiply(A_exp, B_exp, lut)
     return prod.sum(axis=1)
 
-
-def default_nf4_mul_lut(bits: int = 3) -> dict[int, float]:
-    """Utility to get a default empirical LUT for NF4 multiplication."""
-    return build_nf4_mul_lut(NF4_POS_MAG, empirical_lloyd_lut(NF4_POS_MAG, bits=bits))
