@@ -1,5 +1,5 @@
 import torch
-from bitsandbytes.functional import dequantize_4bit, dequantize_blockwise, dequantize_nf4, get_4bit_type, nf4_matmul, quantize_4bit, quantize_blockwise, quantize_nf4, QuantState
+from bitsandbytes.functional import dequantize_4bit, dequantize_blockwise, dequantize_nf4, get_4bit_type, nf4_matmul, nf4_matmul_absmax, quantize_4bit, quantize_blockwise, quantize_nf4, QuantState
 import numpy as np
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,6 +59,9 @@ def test_main():
 
     A = torch.randint(0, 16, (M, K//2), device=device, dtype=torch.uint8)
     B = torch.randint(0, 16, (K//2, N), device=device, dtype=torch.uint8)
+    blocksize = K
+    absmaxA = torch.ones((M,), device=device, dtype=torch.float32)
+    absmaxB = torch.ones((N,), device=device, dtype=torch.float32)
     
     # Convert A and B to float using NF4_MAG_dict
     A_np = A.cpu().numpy()
@@ -75,7 +78,7 @@ def test_main():
 
 
     C_ref = torch.tensor(nf4_matmul_py(A.cpu().numpy(), B.cpu().numpy(), mul_lut), dtype=torch.float32)
-    C = nf4_matmul(A, B).cpu()
+    C = nf4_matmul_absmax(A, B, absmaxA, absmaxB, blocksize).cpu()
     print(C_ref.dtype, C.dtype)
     print("NF4 matmul result (4x4):\n", C_ref)
     print("Reference matmul result (4x4):\n", C)
@@ -101,22 +104,18 @@ def test_main_quantized():
     B_q = B_q.view(K // 2, N)
     
     # NF4 matmul
-    result = nf4_matmul(A_q, B_q)
-        
-    # Scale by combined absmax
-    absmax_combined = A_state.absmax * B_state.absmax
-    result_scaled = result * absmax_combined
+    result = nf4_matmul_absmax(A_q, B_q, A_state.absmax, B_state.absmax, K)
 
-    print(result_scaled.flatten()[:10])
+    print(result.flatten()[:10])
     
     print("Reference shape:", ref.shape)
-    print("Result shape:", result_scaled.shape)
-    print("Max diff:", (ref - result_scaled).abs().max().item())
+    print("Result shape:", result.shape)
+    print("Max diff:", (ref - result).abs().max().item())
     print("Reference norm:", ref.norm().item())
-    print("Result norm:", result_scaled.norm().item())
+    print("Result norm:", result.norm().item())
     
     # Assert close
-    assert torch.allclose(ref, result_scaled, atol=1e-1), "Quantized NF4 matmul does not match reference!"
+    assert torch.allclose(ref, result, atol=1e-1), "Quantized NF4 matmul does not match reference!"
 
 def test_dequantize_comparison():
     # Create some float data
@@ -171,13 +170,8 @@ def test_main_matmul(M, N, K):
     qa = qa.view(M, K // 2)
     qb = qb.view(K // 2, N)
     
-    C = nf4_matmul(qa, qb)
+    C = nf4_matmul_absmax(qa, qb, SA.absmax, SB.absmax, K)
     print(SA.absmax.shape, SB.absmax.shape)
-
-    a_absmax = SA.absmax.reshape(SA.absmax.shape[0], 1)
-    b_absmax = SB.absmax.reshape(1, SB.absmax.shape[0])
-    print(C.shape, a_absmax.shape, b_absmax.shape)
-    C = C * (a_absmax * b_absmax)
 
     print("Reference matmul result (4x4):\n", C)
 
@@ -209,10 +203,10 @@ def test_4bit_quant():
     
     
 
-def test_linear_nf4_compute(M, N, K, batch=1, A=None, B = None):
+def test_linear_nf4_compute(M, N, K, batch=1, blocksize=64, A=None, B = None):
     # Test LinearNF4Compute layer
     print("Testing LinearNF4Compute layer...", )
-    layer = LinearNF4Compute(K, N, bias=False, blocksize=K, compute_dtype=torch.float32, device=device)
+    layer = LinearNF4Compute(K, N, bias=False, blocksize=blocksize, compute_dtype=torch.float32, device=device)
     
     # Create random weights
     W = torch.randn(N, K, dtype=torch.float32, device=device) if B == None else B
@@ -229,7 +223,7 @@ def test_linear_nf4_compute(M, N, K, batch=1, A=None, B = None):
         out = layer(x)
 
     # Reference: x @ W.T
-    layer4bit = Linear4bit(K, N, bias=False, blocksize=K, compute_dtype=torch.float32, device=device)
+    layer4bit = Linear4bit(K, N, bias=False, blocksize=blocksize, compute_dtype=torch.float32, device=device)
     layer4bit.load_state_dict({'weight': W})
     layer4bit.to(device)
     #ref = x @ W.T
@@ -238,7 +232,7 @@ def test_linear_nf4_compute(M, N, K, batch=1, A=None, B = None):
         ref = layer4bit(x)
     
     # Reference 2
-    layer4bitf = Linear4bitFakeQuantAct(K, N, bias=False, compute_dtype=torch.float32, activation_blocksize=K, device=device)
+    layer4bitf = Linear4bitFakeQuantAct(K, N, bias=False, compute_dtype=torch.float32, activation_blocksize=blocksize, device=device)
     layer4bitf.load_state_dict({'weight': W})
     layer4bitf.to(device)
     #ref = x @ W.T
@@ -279,8 +273,6 @@ def test_linear_nf4_compute_3D(M, N, K, batch, A=None, B = None):
     
     # Reference: x @ W.T
     ref = x @ W.T
-
-    layer_fake = Linear4bitFakeQuantAct 
     
     # Forward pass
     with torch.no_grad():
@@ -306,4 +298,4 @@ if __name__ == "__main__":
     #test_main_matmul(128, 128, 128)
     #test_linear_nf4_compute(1024, 128, 64)
     #test3D()
-    test_linear_nf4_compute(64, 64, 64)
+    test_linear_nf4_compute(64, 64, 64, batch=4, blocksize=64)

@@ -260,7 +260,7 @@ def replace_linear_with_fake(module):
                 compress_statistics=False,
                 quant_type="nf4",
                 device=child.weight.device,
-                activation_blocksize=child.in_features,
+                activation_blocksize=64,
             )
 
             # Copy FP16 params over before quantization happens.
@@ -322,7 +322,7 @@ def load_nf4_model(model_id: str, linear_layer: str):
                         compress_statistics=False,
                         #quant_storage=child.quant_storage,
                         device=child.weight.device,
-                        blocksize=child.in_features,
+                        blocksize=64,
                     )
                     # Try to load from the top-level fp16 state dict using the module prefix
                     weight_key = f"{child_prefix}.weight"
