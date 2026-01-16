@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Evaluate NF4-quantized LLAMA models on commonsense multiple-choice benchmarks.
+Evaluate NF4-quantized LLAMA models on commonsense multiple-choice and
+generative benchmarks.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
+import re
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
@@ -21,13 +24,17 @@ except ImportError:
     Linear4bitFakeQuantAct = None
     LinearNF4Compute = None
 
+from bitsandbytes.functional import set_nf4_ewm_lut
+
 @dataclass
 class TaskSpec:
     dataset: str
     config: str | None
     split: str
-    builder: Callable[[dict], tuple[str, list[str], int]]
+    builder: Callable[[dict], tuple]
     trust_remote_code: bool = False
+    task_type: str = "mcq"
+    metric: str = "accuracy"
 
 
 LETTERS = ["A", "B", "C", "D", "E", "F"]
@@ -133,6 +140,26 @@ def commonsenseqa_builder(example: dict) -> tuple[str, list[str], int]:
     return prompt, [label for label, _ in options], answer_idx
 
 
+def xsum_builder(example: dict) -> tuple[str, str]:
+    prompt = (
+        "Summarize the following article.\n"
+        f"Article: {example['document']}\n"
+        "Summary:"
+    )
+    return prompt, example["summary"]
+
+
+def wmt14_de_en_builder(example: dict) -> tuple[str, str]:
+    source = example["translation"]["de"]
+    target = example["translation"]["en"]
+    prompt = (
+        "Translate German to English.\n"
+        f"German: {source}\n"
+        "English:"
+    )
+    return prompt, target
+
+
 TASK_SPECS: dict[str, TaskSpec] = {
     "piqa": TaskSpec(
         dataset="piqa",
@@ -184,11 +211,27 @@ TASK_SPECS: dict[str, TaskSpec] = {
         split="validation",
         builder=commonsenseqa_builder,
     ),
+    "xsum": TaskSpec(
+        dataset="xsum",
+        config=None,
+        split="validation",
+        builder=xsum_builder,
+        task_type="gen",
+        metric="rougeL",
+    ),
+    "wmt14_de_en": TaskSpec(
+        dataset="wmt14",
+        config="de-en",
+        split="test",
+        builder=wmt14_de_en_builder,
+        task_type="gen",
+        metric="bleu",
+    ),
 }
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate NF4-quantized LLAMA models on benchmark QA tasks."
+        description="Evaluate NF4-quantized LLAMA models on benchmark tasks."
     )
     parser.add_argument(
         "--model",
@@ -209,10 +252,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on the number of examples per task.",
     )
     parser.add_argument(
+        "--lut-size",
+        type=int,
+        choices=[3, 4, 5, 6, 7, 8],
+        default=8,
+        help="NF4 EWM LUT size to use.",
+    )
+    parser.add_argument(
         "--linear_layer",
         choices=["Linear", "Linear4bit", "Linear4bitFakeQuantAct", "LinearNF4Compute"],
         default="Linear4bit",
         help="Type of linear layer to use for the model.",
+    )
+    parser.add_argument(
+        "--gen-max-new-tokens",
+        type=int,
+        default=128,
+        help="Max new tokens for generative tasks.",
+    )
+    parser.add_argument(
+        "--gen-do-sample",
+        action="store_true",
+        help="Enable sampling for generative tasks.",
+    )
+    parser.add_argument(
+        "--gen-top-p",
+        type=float,
+        default=1.0,
+        help="Top-p nucleus sampling value for generative tasks.",
+    )
+    parser.add_argument(
+        "--gen-temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for generative tasks.",
     )
     return parser
 
@@ -417,19 +490,173 @@ def evaluate_task(
     print(f"{name}: {accuracy * 100:.2f}% ({correct}/{total})")
     return accuracy
 
-from bitsandbytes.functional import set_nf4_ewm_lut
-# default is 8
-set_nf4_ewm_lut(5)  # or 4, 5
 
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    model, tokenizer = load_nf4_model(args.model, args.linear_layer)
-    
-    for name, param in model.named_parameters():
-        if torch.isnan(param).any() or torch.isinf(param).any():
-            print(f"{name} contains NaN or inf")
+TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
+
+def tokenize_text(text: str) -> list[str]:
+    return TOKEN_RE.findall(text.lower().strip())
+
+
+def lcs_length(a: list[str], b: list[str]) -> int:
+    if not a or not b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    prev = [0] * (len(b) + 1)
+    for token in a:
+        curr = [0]
+        for j, b_token in enumerate(b, start=1):
+            if token == b_token:
+                curr.append(prev[j - 1] + 1)
+            else:
+                curr.append(max(prev[j], curr[-1]))
+        prev = curr
+    return prev[-1]
+
+
+def rouge_l_f1(hypothesis: str, references: Sequence[str]) -> float:
+    hyp_tokens = tokenize_text(hypothesis)
+    if not hyp_tokens:
+        return 0.0
+    best = 0.0
+    for ref in references:
+        ref_tokens = tokenize_text(ref)
+        if not ref_tokens:
+            continue
+        lcs = lcs_length(hyp_tokens, ref_tokens)
+        precision = lcs / len(hyp_tokens) if hyp_tokens else 0.0
+        recall = lcs / len(ref_tokens) if ref_tokens else 0.0
+        if precision + recall == 0:
+            score = 0.0
+        else:
+            score = 2 * precision * recall / (precision + recall)
+        best = max(best, score)
+    return best
+
+
+def ngram_counts(tokens: list[str], n: int) -> dict[tuple[str, ...], int]:
+    counts: dict[tuple[str, ...], int] = {}
+    if len(tokens) < n:
+        return counts
+    for i in range(len(tokens) - n + 1):
+        ngram = tuple(tokens[i : i + n])
+        counts[ngram] = counts.get(ngram, 0) + 1
+    return counts
+
+
+def update_bleu_stats(
+    stats: dict[str, list[int] | int],
+    hyp_tokens: list[str],
+    references: Sequence[str],
+) -> None:
+    ref_tokens_list = [tokenize_text(ref) for ref in references]
+    if not ref_tokens_list:
+        return
+
+    hyp_len = len(hyp_tokens)
+    stats["hyp_len"] += hyp_len
+    ref_len = min(ref_tokens_list, key=lambda r: (abs(len(r) - hyp_len), len(r)))
+    stats["ref_len"] += len(ref_len)
+
+    for n in range(1, 5):
+        hyp_counts = ngram_counts(hyp_tokens, n)
+        max_ref_counts: dict[tuple[str, ...], int] = {}
+        for ref_tokens in ref_tokens_list:
+            ref_counts = ngram_counts(ref_tokens, n)
+            for ngram, count in ref_counts.items():
+                if count > max_ref_counts.get(ngram, 0):
+                    max_ref_counts[ngram] = count
+        clipped = 0
+        for ngram, count in hyp_counts.items():
+            clipped += min(count, max_ref_counts.get(ngram, 0))
+        stats["clipped"][n - 1] += clipped
+        stats["total"][n - 1] += max(len(hyp_tokens) - n + 1, 0)
+
+
+def compute_bleu(stats: dict[str, list[int] | int]) -> float:
+    hyp_len = stats["hyp_len"]
+    ref_len = stats["ref_len"]
+    if hyp_len == 0:
+        return 0.0
+    bp = 1.0 if hyp_len > ref_len else math.exp(1 - ref_len / hyp_len)
+    log_precisions = 0.0
+    for n in range(4):
+        clipped = stats["clipped"][n]
+        total = stats["total"][n]
+        precision = (clipped + 1) / (total + 1)
+        log_precisions += math.log(precision)
+    bleu = bp * math.exp(log_precisions / 4)
+    return bleu
+
+
+def generate_completion(model, tokenizer, prompt: str, args: argparse.Namespace) -> str:
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt_len = inputs["input_ids"].shape[1]
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=args.gen_max_new_tokens,
+            do_sample=args.gen_do_sample,
+            top_p=args.gen_top_p,
+            temperature=args.gen_temperature,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    gen_ids = outputs[0][prompt_len:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+
+def evaluate_gen_task(
+    name: str,
+    spec: TaskSpec,
+    model,
+    tokenizer,
+    max_samples: int | None,
+    args: argparse.Namespace,
+) -> float:
+    dataset = load_dataset(
+        spec.dataset,
+        spec.config,
+        split=spec.split,
+        trust_remote_code=spec.trust_remote_code,
+    )
+    total = len(dataset)
+    if max_samples is not None:
+        total = min(total, max_samples)
+        dataset = dataset.select(range(total))
+
+    iterator: Iterable[dict] = tqdm(dataset, desc=name, unit="ex")
+
+    if spec.metric == "bleu":
+        stats: dict[str, list[int] | int] = {
+            "clipped": [0, 0, 0, 0],
+            "total": [0, 0, 0, 0],
+            "hyp_len": 0,
+            "ref_len": 0,
+        }
+        for example in iterator:
+            prompt, references = spec.builder(example)
+            if isinstance(references, str):
+                references = [references]
+            hypothesis = generate_completion(model, tokenizer, prompt, args)
+            update_bleu_stats(stats, tokenize_text(hypothesis), references)
+        score = compute_bleu(stats)
+        print(f"{name} BLEU: {score * 100:.2f}")
+        return score
+
+    total_score = 0.0
+    for example in iterator:
+        prompt, references = spec.builder(example)
+        if isinstance(references, str):
+            references = [references]
+        hypothesis = generate_completion(model, tokenizer, prompt, args)
+        total_score += rouge_l_f1(hypothesis, references)
+    avg_score = total_score / total if total else 0.0
+    print(f"{name} ROUGE-L: {avg_score * 100:.2f}")
+    return avg_score
+
+
+def gen_test(model, tokenizer):
     # Test with random input
     test_prompt = "Hello, how are you?"
     inputs = tokenizer(test_prompt, return_tensors="pt").to(model.device)
@@ -449,6 +676,20 @@ def main() -> None:
         print("Proceeding with evaluation tasks...")
     return
 
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    print("Setting NF4 EWM LUT size to", args.lut_size)
+    set_nf4_ewm_lut(args.lut_size) 
+    model, tokenizer = load_nf4_model(args.model, args.linear_layer)
+    
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"{name} contains NaN or inf")
+
+    #gen_test(model, tokenizer)
+    
     if "all" in args.tasks:
         task_names = list(TASK_SPECS.keys())
     else:
@@ -457,13 +698,29 @@ def main() -> None:
     results = {}
     for task_name in task_names:
         spec = TASK_SPECS[task_name]
-        acc = evaluate_task(task_name, spec, model, tokenizer, args.max_samples)
-        results[task_name] = acc
+        if spec.task_type == "gen":
+            score = evaluate_gen_task(
+                task_name,
+                spec,
+                model,
+                tokenizer,
+                args.max_samples,
+                args,
+            )
+        else:
+            score = evaluate_task(task_name, spec, model, tokenizer, args.max_samples)
+        results[task_name] = score
 
     print("\nSummary:")
     for task_name in task_names:
-        acc = results[task_name]
-        print(f"- {task_name}: {acc * 100:.2f}%")
+        spec = TASK_SPECS[task_name]
+        score = results[task_name]
+        if spec.metric == "accuracy":
+            print(f"- {task_name}: {score * 100:.2f}%")
+        elif spec.metric == "bleu":
+            print(f"- {task_name} (BLEU): {score * 100:.2f}")
+        else:
+            print(f"- {task_name} (ROUGE-L): {score * 100:.2f}")
 
 
 if __name__ == "__main__":
