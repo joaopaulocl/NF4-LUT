@@ -18,13 +18,25 @@ from datasets import load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 try:
-    from bitsandbytes.nn import Linear4bit, Linear4bitFakeQuantAct, LinearNF4Compute
+    from bitsandbytes.nn import (
+        Linear4bit,
+        Linear4bitFakeQuantAct,
+        LinearNF4Compute,
+        LinearApproxFP32,
+        LinearApproxFP16,
+        LinearApproxFP8E4M3,
+        LinearApproxFP8E5M2,
+    )
 except ImportError:
     from bitsandbytes.nn import Linear4bit
     Linear4bitFakeQuantAct = None
     LinearNF4Compute = None
+    LinearApproxFP32 = None
+    LinearApproxFP16 = None
+    LinearApproxFP8E4M3 = None
+    LinearApproxFP8E5M2 = None
 
-from bitsandbytes.functional import set_nf4_ewm_lut
+from bitsandbytes.functional import set_nf4_ewm_lut, set_nf4_ewm_lut_data
 
 @dataclass
 class TaskSpec:
@@ -38,6 +50,18 @@ class TaskSpec:
 
 
 LETTERS = ["A", "B", "C", "D", "E", "F"]
+MCQ_PROMPT_STYLE = "default"
+PIQA_PROMPT_STYLE: str | None = None
+SIQA_PROMPT_STYLE: str | None = None
+HELLASWAG_PROMPT_STYLE: str | None = None
+WINOGRANDE_PROMPT_STYLE: str | None = None
+ARC_PROMPT_STYLE: str | None = None
+OPENBOOKQA_PROMPT_STYLE: str | None = None
+COMMONSENSEQA_PROMPT_STYLE: str | None = None
+
+
+def resolve_mcq_style(override: str | None) -> str:
+    return override or MCQ_PROMPT_STYLE
 
 
 def make_prompt(instruction: str, body: str, options: Sequence[tuple[str, str]]) -> str:
@@ -53,91 +77,112 @@ def make_prompt(instruction: str, body: str, options: Sequence[tuple[str, str]])
     return "\n".join(lines)
 
 
-def piqa_builder(example: dict) -> tuple[str, list[str], int]:
+def piqa_builder(example: dict) -> tuple[str, list[tuple[str, str]], int]:
     options = [(LETTERS[i], example[f"sol{i + 1}"]) for i in range(2)]
-    prompt = make_prompt(
-        "Choose the option that best completes the goal.",
-        f"Goal: {example['goal']}",
-        options,
-    )
-    return prompt, [label for label, _ in options], int(example["label"])
+    if resolve_mcq_style(PIQA_PROMPT_STYLE) == "lm_eval":
+        prompt = f"Goal: {example['goal']}\nSolution:"
+    else:
+        prompt = make_prompt(
+            "Choose the option that best completes the goal.",
+            f"Goal: {example['goal']}",
+            options,
+        )
+    return prompt, options, int(example["label"])
 
 
-def siqa_builder(example: dict) -> tuple[str, list[str], int]:
+def siqa_builder(example: dict) -> tuple[str, list[tuple[str, str]], int]:
     options = [
         (LETTERS[0], example["answerA"]),
         (LETTERS[1], example["answerB"]),
         (LETTERS[2], example["answerC"]),
     ]
-    prompt = make_prompt(
-        "Given the situation, pick the most sensible answer.",
-        f"Context: {example['context']}\nQuestion: {example['question']}",
-        options,
-    )
-    return prompt, [label for label, _ in options], int(example["label"]) - 1
+    if resolve_mcq_style(SIQA_PROMPT_STYLE) == "lm_eval":
+        prompt = f"Context: {example['context']}\nQuestion: {example['question']}\nAnswer:"
+    else:
+        prompt = make_prompt(
+            "Given the situation, pick the most sensible answer.",
+            f"Context: {example['context']}\nQuestion: {example['question']}",
+            options,
+        )
+    return prompt, options, int(example["label"]) - 1
 
 
-def hellaswag_builder(example: dict) -> tuple[str, list[str], int]:
+def hellaswag_builder(example: dict) -> tuple[str, list[tuple[str, str]], int]:
     options = [(LETTERS[i], ending) for i, ending in enumerate(example["endings"])]
-    prompt = make_prompt(
-        "Choose the most plausible continuation.",
-        f"Premise: {example['ctx']}",
-        options,
-    )
-    return prompt, [label for label, _ in options], int(example["label"])
+    if resolve_mcq_style(HELLASWAG_PROMPT_STYLE) == "lm_eval":
+        prompt = f"Context: {example['ctx']}\nContinuation:"
+    else:
+        prompt = make_prompt(
+            "Choose the most plausible continuation.",
+            f"Premise: {example['ctx']}",
+            options,
+        )
+    return prompt, options, int(example["label"])
 
 
-def winogrande_builder(example: dict) -> tuple[str, list[str], int]:
+def winogrande_builder(example: dict) -> tuple[str, list[tuple[str, str]], int]:
     base_sentence = example["sentence"].replace("_", "_____")
     options = [
         (LETTERS[0], example["option1"]),
         (LETTERS[1], example["option2"]),
     ]
-    prompt = make_prompt(
-        "Fill in the blank in the sentence with the most sensible option.",
-        base_sentence,
-        options,
-    )
-    return prompt, [label for label, _ in options], int(example["answer"]) - 1
+    if resolve_mcq_style(WINOGRANDE_PROMPT_STYLE) == "lm_eval":
+        prompt = f"Sentence: {base_sentence}\nAnswer:"
+    else:
+        prompt = make_prompt(
+            "Fill in the blank in the sentence with the most sensible option.",
+            base_sentence,
+            options,
+        )
+    return prompt, options, int(example["answer"]) - 1
 
 
-def arc_builder(example: dict) -> tuple[str, list[str], int]:
+def arc_builder(example: dict) -> tuple[str, list[tuple[str, str]], int]:
     labels = example["choices"]["label"]
     texts = example["choices"]["text"]
     options = [(label, text) for label, text in zip(labels, texts)]
-    prompt = make_prompt(
-        "Pick the correct answer to the science exam question.",
-        example["question"],
-        options,
-    )
+    if resolve_mcq_style(ARC_PROMPT_STYLE) == "lm_eval":
+        prompt = f"Question: {example['question']}\nAnswer:"
+    else:
+        prompt = make_prompt(
+            "Pick the correct answer to the science exam question.",
+            example["question"],
+            options,
+        )
     correct_idx = labels.index(example["answerKey"])
-    return prompt, [label for label, _ in options], correct_idx
+    return prompt, options, correct_idx
 
 
-def openbookqa_builder(example: dict) -> tuple[str, list[str], int]:
+def openbookqa_builder(example: dict) -> tuple[str, list[tuple[str, str]], int]:
     labels = example["choices"]["label"]
     texts = example["choices"]["text"]
     options = [(label, text) for label, text in zip(labels, texts)]
-    prompt = make_prompt(
-        "Answer the elementary science question.",
-        example["question_stem"],
-        options,
-    )
+    if resolve_mcq_style(OPENBOOKQA_PROMPT_STYLE) == "lm_eval":
+        prompt = f"Question: {example['question_stem']}\nAnswer:"
+    else:
+        prompt = make_prompt(
+            "Answer the elementary science question.",
+            example["question_stem"],
+            options,
+        )
     answer_idx = labels.index(example["answerKey"])
-    return prompt, [label for label, _ in options], answer_idx
+    return prompt, options, answer_idx
 
 
-def commonsenseqa_builder(example: dict) -> tuple[str, list[str], int]:
+def commonsenseqa_builder(example: dict) -> tuple[str, list[tuple[str, str]], int]:
     labels = example["choices"]["label"]
     texts = example["choices"]["text"]
     options = [(label, text) for label, text in zip(labels, texts)]
-    prompt = make_prompt(
-        "Answer the commonsense question.",
-        example["question"],
-        options,
-    )
+    if resolve_mcq_style(COMMONSENSEQA_PROMPT_STYLE) == "lm_eval":
+        prompt = f"Question: {example['question']}\nAnswer:"
+    else:
+        prompt = make_prompt(
+            "Answer the commonsense question.",
+            example["question"],
+            options,
+        )
     answer_idx = labels.index(example["answerKey"])
-    return prompt, [label for label, _ in options], answer_idx
+    return prompt, options, answer_idx
 
 
 def xsum_builder(example: dict) -> tuple[str, str]:
@@ -260,9 +305,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--linear_layer",
-        choices=["Linear", "Linear4bit", "Linear4bitFakeQuantAct", "LinearNF4Compute"],
+        choices=[
+            "Linear",
+            "Linear4bit",
+            "Linear4bitFakeQuantAct",
+            "LinearNF4Compute",
+            "LinearApproxFP32",
+            "LinearApproxFP16",
+            "LinearApproxFP8E4M3",
+            "LinearApproxFP8E5M2",
+        ],
         default="Linear4bit",
-        help="Type of linear layer to use for the model.",
+        help=(
+            "Type of linear layer to use for the model. "
+            "LinearApprox* variants replace nn.Linear with approximate-matmul layers "
+            "without any weight quantization. "
+            "FP8 variants cast weights from the loaded FP16 checkpoint."
+        ),
     )
     parser.add_argument(
         "--gen-max-new-tokens",
@@ -287,7 +346,66 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.7,
         help="Sampling temperature for generative tasks.",
     )
+    parser.add_argument(
+        "--mcq-prompt-style",
+        choices=["default", "lm_eval"],
+        default="default",
+        help="Default prompt template for MCQ tasks (default: script prompts; lm_eval: LM-Eval-Harness style).",
+    )
+    parser.add_argument(
+        "--piqa-prompt-style",
+        choices=["default", "lm_eval"],
+        default=None,
+        help="Prompt template for PIQA (overrides --mcq-prompt-style).",
+    )
+    parser.add_argument(
+        "--siqa-prompt-style",
+        choices=["default", "lm_eval"],
+        default=None,
+        help="Prompt template for SIQA (overrides --mcq-prompt-style).",
+    )
     return parser
+
+_APPROX_LAYER_CLASSES = {
+    "LinearApproxFP32": LinearApproxFP32,
+    "LinearApproxFP16": LinearApproxFP16,
+    "LinearApproxFP8E4M3": LinearApproxFP8E4M3,
+    "LinearApproxFP8E5M2": LinearApproxFP8E5M2,
+}
+
+# Load dtype for each approx variant.
+# FP32 needs the full-precision source; FP16/FP8 load in FP16 (memory-efficient,
+# and the best practical source for FP8 weight casting since most checkpoints are FP16).
+_APPROX_LOAD_DTYPE = {
+    "LinearApproxFP32": torch.float32,
+    "LinearApproxFP16": torch.float16,
+    "LinearApproxFP8E4M3": torch.float16,
+    "LinearApproxFP8E5M2": torch.float16,
+}
+
+
+def replace_linear_with_approx(module: nn.Module, layer_cls: type) -> None:
+    """Recursively replace every nn.Linear with an instance of *layer_cls*.
+
+    Weights are copied and cast to whatever dtype the target class stores
+    (float32, float16, or float8).  Bias tensors are kept in float32.
+    The replacement is done in-place on the same device as the original layer.
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear) and not isinstance(child, layer_cls):
+            device = child.weight.device
+            new_layer = layer_cls(child.in_features, child.out_features, bias=child.bias is not None)
+            with torch.no_grad():
+                # weight may be an nn.Parameter or a buffer (FP8 case)
+                tgt_dtype = new_layer.weight.dtype
+                new_layer.weight.copy_(child.weight.data.to(tgt_dtype))
+                if child.bias is not None:
+                    new_layer.bias.data.copy_(child.bias.data)
+            new_layer = new_layer.to(device)
+            setattr(module, name, new_layer)
+        else:
+            replace_linear_with_approx(child, layer_cls)
+
 
 def replace_linear4bit_with_fake(module):
     if Linear4bitFakeQuantAct is None:
@@ -381,7 +499,7 @@ def load_nf4_model(model_id: str, linear_layer: str):
             model_id, dtype=torch.float16, device_map="auto"
         )
         model.eval()
-        fp16_state = model.state_dict()
+        fp_state = model.state_dict()
 
         def replace_linear_with_nf4(module, prefix=""):
             for name, child in module.named_children():
@@ -397,16 +515,16 @@ def load_nf4_model(model_id: str, linear_layer: str):
                         device=child.weight.device,
                         blocksize=64,
                     )
-                    # Try to load from the top-level fp16 state dict using the module prefix
+                    # Try to load from the top-level fp state dict using the module prefix
                     weight_key = f"{child_prefix}.weight"
                     bias_key = f"{child_prefix}.bias"
-                    if weight_key in fp16_state:
-                        sd = {"weight": fp16_state[weight_key]}
-                        if bias_key in fp16_state:
-                            sd["bias"] = fp16_state[bias_key]
+                    if weight_key in fp_state:
+                        sd = {"weight": fp_state[weight_key]}
+                        if bias_key in fp_state:
+                            sd["bias"] = fp_state[bias_key]
                     else:
                         # fallback to child's own parameters
-                        print("Warning: could not find", weight_key, "in fp16 state dict")
+                        print("Warning: could not find", weight_key, "in fp state dict")
                         child_sd = child.state_dict()
                         sd = {k: v for k, v in child_sd.items()}
 
@@ -422,9 +540,19 @@ def load_nf4_model(model_id: str, linear_layer: str):
         replace_linear_with_nf4(model)
         model.eval()
 
-    else:   
+    elif linear_layer in _APPROX_LAYER_CLASSES:
+        layer_cls = _APPROX_LAYER_CLASSES[linear_layer]
+        load_dtype = _APPROX_LOAD_DTYPE[linear_layer]
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, dtype=torch.float16, device_map="auto"
+            model_id, torch_dtype=load_dtype, device_map="auto"
+        )
+        model.eval()
+        replace_linear_with_approx(model, layer_cls)
+        model.eval()
+
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=torch.float16, device_map="cuda"
         )
 
     return model, tokenizer
@@ -475,10 +603,10 @@ def evaluate_task(
     iterator: Iterable[dict] = tqdm(dataset, desc=name, unit="ex")
 
     for example in iterator:
-        prompt, labels, answer_idx = spec.builder(example)
+        prompt, options, answer_idx = spec.builder(example)
         prompt_inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         prompt_ids = prompt_inputs["input_ids"]
-        completions = [f" {label}" for label in labels]
+        completions = [f" {text}" for _, text in options]
         scores = [
             score_option(model, tokenizer, prompt_ids, completion)
             for completion in completions
@@ -680,14 +808,26 @@ def gen_test(model, tokenizer):
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    print("Setting NF4 EWM LUT size to", args.lut_size)
-    set_nf4_ewm_lut(args.lut_size) 
+    global MCQ_PROMPT_STYLE
+    global PIQA_PROMPT_STYLE
+    global SIQA_PROMPT_STYLE
+    MCQ_PROMPT_STYLE = args.mcq_prompt_style
+    PIQA_PROMPT_STYLE = args.piqa_prompt_style
+    SIQA_PROMPT_STYLE = args.siqa_prompt_style
+    #print("Setting NF4 EWM LUT size to", args.lut_size)
+    #set_nf4_ewm_lut(args.lut_size) 
+
+    #my_lut_256 = [1.0, 1.0, 0.5856893760119567, 0.5856893760119567, 0.36044934294192454, 0.21465849130729, 0.12459118891348239, 0.001425656162998522, -0.12406648673040939, -0.20685253345347152, -0.33690320658828365, -0.33690320658828365, -0.566538508588858, -0.566538508588858, -1.0, -1.0, 1.0, 0.5856893760119567, 0.36044934294192454, 0.36044934294192454, 0.21465849130729, 0.12459118891348239, 0.07216246059813591, 0.001425656162998522, -0.07125976569357444, -0.12406648673040939, -0.20685253345347152, -0.33690320658828365, -0.33690320658828365, -0.566538508588858, -0.566538508588858, -1.0, 0.5856893760119567, 0.36044934294192454, 0.36044934294192454, 0.21465849130729, 0.21465849130729, 0.12459118891348239, 0.07216246059813591, 0.001425656162998522, -0.03877756929350688, -0.12406648673040939, -0.12406648673040939, -0.20685253345347152, -0.33690320658828365, -0.33690320658828365, -0.566538508588858, -0.566538508588858, 0.5856893760119567, 0.36044934294192454, 0.21465849130729, 0.21465849130729, 0.12459118891348239, 0.07216246059813591, 0.0356305411614352, 0.001425656162998522, -0.03877756929350688, -0.07125976569357444, -0.12406648673040939, -0.20685253345347152, -0.20685253345347152, -0.33690320658828365, -0.33690320658828365, -0.566538508588858, 0.36044934294192454, 0.21465849130729, 0.21465849130729, 0.12459118891348239, 0.12459118891348239, 0.07216246059813591, 0.0356305411614352, 0.001425656162998522, -0.03877756929350688, -0.07125976569357444, -0.07125976569357444, -0.12406648673040939, -0.12406648673040939, -0.20685253345347152, -0.20685253345347152, -0.33690320658828365, 0.21465849130729, 0.12459118891348239, 0.12459118891348239, 0.07216246059813591, 0.07216246059813591, 0.0356305411614352, 0.0356305411614352, 0.001425656162998522, -0.01513044631792837, -0.03877756929350688, -0.07125976569357444, -0.07125976569357444, -0.12406648673040939, -0.12406648673040939, -0.20685253345347152, -0.20685253345347152, 0.12459118891348239, 0.07216246059813591, 0.07216246059813591, 0.0356305411614352, 0.0356305411614352, 0.0356305411614352, 0.001425656162998522, 0.001425656162998522, -0.01513044631792837, -0.01513044631792837, -0.03877756929350688, -0.03877756929350688, -0.03877756929350688, -0.07125976569357444, -0.07125976569357444, -0.12406648673040939, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, -0.12406648673040939, -0.07125976569357444, -0.03877756929350688, -0.03877756929350688, -0.03877756929350688, -0.01513044631792837, -0.01513044631792837, 0.001425656162998522, 0.001425656162998522, 0.001425656162998522, 0.0356305411614352, 0.0356305411614352, 0.0356305411614352, 0.07216246059813591, 0.07216246059813591, 0.12459118891348239, -0.20685253345347152, -0.12406648673040939, -0.12406648673040939, -0.07125976569357444, -0.07125976569357444, -0.03877756929350688, -0.01513044631792837, 0.001425656162998522, 0.001425656162998522, 0.0356305411614352, 0.0356305411614352, 0.07216246059813591, 0.07216246059813591, 0.12459118891348239, 0.12459118891348239, 0.21465849130729, -0.33690320658828365, -0.20685253345347152, -0.12406648673040939, -0.12406648673040939, -0.07125976569357444, -0.07125976569357444, -0.03877756929350688, 0.001425656162998522, 0.0356305411614352, 0.0356305411614352, 0.07216246059813591, 0.12459118891348239, 0.12459118891348239, 0.21465849130729, 0.21465849130729, 0.36044934294192454, -0.33690320658828365, -0.33690320658828365, -0.20685253345347152, -0.20685253345347152, -0.12406648673040939, -0.07125976569357444, -0.03877756929350688, 0.001425656162998522, 0.0356305411614352, 0.07216246059813591, 0.12459118891348239, 0.12459118891348239, 0.21465849130729, 0.21465849130729, 0.36044934294192454, 0.36044934294192454, -0.566538508588858, -0.33690320658828365, -0.33690320658828365, -0.20685253345347152, -0.12406648673040939, -0.12406648673040939, -0.03877756929350688, 0.001425656162998522, 0.0356305411614352, 0.07216246059813591, 0.12459118891348239, 0.21465849130729, 0.21465849130729, 0.36044934294192454, 0.36044934294192454, 0.5856893760119567, -0.566538508588858, -0.566538508588858, -0.33690320658828365, -0.33690320658828365, -0.20685253345347152, -0.12406648673040939, -0.07125976569357444, 0.001425656162998522, 0.07216246059813591, 0.12459118891348239, 0.21465849130729, 0.21465849130729, 0.36044934294192454, 0.36044934294192454, 0.5856893760119567, 0.5856893760119567, -1.0, -0.566538508588858, -0.566538508588858, -0.33690320658828365, -0.20685253345347152, -0.20685253345347152, -0.07125976569357444, 0.001425656162998522, 0.07216246059813591, 0.12459118891348239, 0.21465849130729, 0.36044934294192454, 0.36044934294192454, 0.5856893760119567, 0.5856893760119567, 1.0, -1.0, -1.0, -0.566538508588858, -0.566538508588858, -0.33690320658828365, -0.20685253345347152, -0.12406648673040939, 0.001425656162998522, 0.12459118891348239, 0.21465849130729, 0.36044934294192454, 0.36044934294192454, 0.5856893760119567, 0.5856893760119567, 1.0, 1.0]
+    
+    #my_lut_256 = [1.0, 0.6151495575904846, 0.6151495575904846, 0.41117098927497864, 0.30240583419799805, 0.19187599420547485, 0.0928705558180809, 0.0, -0.08183729648590088, -0.16875550150871277, -0.23373964428901672, -0.30201980471611023, -0.40173059701919556, -0.602031409740448, -0.602031409740448, -1.0, 0.6151495575904846, 0.41117098927497864, 0.41117098927497864, 0.30240583419799805, 0.19187599420547485, 0.1161937415599823, 0.058739397674798965, 0.0, -0.06344498693943024, -0.12673068046569824, -0.16875550150871277, -0.23373964428901672, -0.30201980471611023, -0.40173059701919556, -0.602031409740448, -0.602031409740448, 0.6151495575904846, 0.41117098927497864, 0.30240583419799805, 0.19187599420547485, 0.15014491975307465, 0.0928705558180809, 0.04837945103645325, 0.0, -0.044877730309963226, -0.08183729648590088, -0.12673068046569824, -0.16875550150871277, -0.23373964428901672, -0.30201980471611023, -0.40173059701919556, -0.602031409740448, 0.41117098927497864, 0.30240583419799805, 0.19187599420547485, 0.15014491975307465, 0.1161937415599823, 0.07713169604539871, 0.04837945103645325, 0.0, -0.030643491074442863, -0.06344498693943024, -0.09707945585250854, -0.12673068046569824, -0.16875550150871277, -0.23373964428901672, -0.30201980471611023, -0.40173059701919556, 0.30240583419799805, 0.19187599420547485, 0.15014491975307465, 0.1161937415599823, 0.07713169604539871, 0.04837945103645325, 0.04837945103645325, 0.0, -0.030643491074442863, -0.044877730309963226, -0.06344498693943024, -0.09707945585250854, -0.12673068046569824, -0.16875550150871277, -0.19520613551139832, -0.30201980471611023, 0.19187599420547485, 0.1161937415599823, 0.0928705558180809, 0.07713169604539871, 0.04837945103645325, 0.04837945103645325, 0.0, 0.0, -0.030643491074442863, -0.030643491074442863, -0.044877730309963226, -0.06344498693943024, -0.08183729648590088, -0.09707945585250854, -0.12673068046569824, -0.19520613551139832, 0.0928705558180809, 0.058739397674798965, 0.04837945103645325, 0.04837945103645325, 0.04837945103645325, 0.0, 0.0, 0.0, 0.0, -0.030643491074442863, -0.030643491074442863, -0.030643491074442863, -0.044877730309963226, -0.044877730309963226, -0.06344498693943024, -0.09707945585250854, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.08183729648590088, -0.06344498693943024, -0.044877730309963226, -0.030643491074442863, -0.030643491074442863, -0.030643491074442863, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04837945103645325, 0.04837945103645325, 0.04837945103645325, 0.058739397674798965, 0.07713169604539871, -0.16875550150871277, -0.12673068046569824, -0.08183729648590088, -0.06344498693943024, -0.044877730309963226, -0.030643491074442863, -0.030643491074442863, 0.0, 0.0, 0.04837945103645325, 0.04837945103645325, 0.058739397674798965, 0.07713169604539871, 0.0928705558180809, 0.1161937415599823, 0.15014491975307465, -0.23373964428901672, -0.16875550150871277, -0.12673068046569824, -0.09707945585250854, -0.06344498693943024, -0.044877730309963226, -0.030643491074442863, 0.0, 0.0, 0.04837945103645325, 0.058739397674798965, 0.07713169604539871, 0.1161937415599823, 0.15014491975307465, 0.19187599420547485, 0.2461204081773758, -0.30201980471611023, -0.23373964428901672, -0.16875550150871277, -0.12673068046569824, -0.09707945585250854, -0.06344498693943024, -0.030643491074442863, 0.0, 0.04837945103645325, 0.058739397674798965, 0.07713169604539871, 0.1161937415599823, 0.15014491975307465, 0.19187599420547485, 0.2461204081773758, 0.30240583419799805, -0.40173059701919556, -0.30201980471611023, -0.23373964428901672, -0.16875550150871277, -0.12673068046569824, -0.08183729648590088, -0.044877730309963226, 0.0, 0.04837945103645325, 0.07713169604539871, 0.1161937415599823, 0.15014491975307465, 0.19187599420547485, 0.2461204081773758, 0.30240583419799805, 0.41117098927497864, -0.602031409740448, -0.40173059701919556, -0.30201980471611023, -0.23373964428901672, -0.16875550150871277, -0.09707945585250854, -0.044877730309963226, 0.0, 0.04837945103645325, 0.0928705558180809, 0.15014491975307465, 0.19187599420547485, 0.2461204081773758, 0.30240583419799805, 0.41117098927497864, 0.6151495575904846, -0.602031409740448, -0.602031409740448, -0.40173059701919556, -0.30201980471611023, -0.19520613551139832, -0.12673068046569824, -0.06344498693943024, 0.0, 0.058739397674798965, 0.1161937415599823, 0.19187599420547485, 0.2461204081773758, 0.30240583419799805, 0.41117098927497864, 0.6151495575904846, 0.6151495575904846, -1.0, -0.602031409740448, -0.602031409740448, -0.40173059701919556, -0.30201980471611023, -0.19520613551139832, -0.09707945585250854, 0.0, 0.07713169604539871, 0.15014491975307465, 0.2461204081773758, 0.30240583419799805, 0.41117098927497864, 0.6151495575904846, 0.6151495575904846, 1.0]
+    #no +-1s
+    my_lut_256 = [1.0, 1.0, 0.5856893760119567, 0.5856893760119567, 0.36044934294192454, 0.2379464204868627, 0.10345854955312216, 0.0002454255115474395, -0.09275731925775, -0.21258522056358756, -0.2828921716640679, -0.41486347893929015, -0.6298858034284472, -0.6298858034284472, -1.0, -1.0, 1.0, 0.5856893760119567, 0.36044934294192454, 0.36044934294192454, 0.2379464204868627, 0.14409246451938135, 0.06691345227408212, 0.0002454255115474395, -0.05782855768018973, -0.14430502854452312, -0.21258522056358756, -0.2828921716640679, -0.41486347893929015, -0.41486347893929015, -0.6298858034284472, -1.0, 0.5856893760119567, 0.36044934294192454, 0.36044934294192454, 0.2379464204868627, 0.18619549755282502, 0.10345854955312216, 0.06691345227408212, 0.0002454255115474395, -0.05782855768018973, -0.09275731925775, -0.14430502854452312, -0.21258522056358756, -0.2828921716640679, -0.41486347893929015, -0.41486347893929015, -0.6298858034284472, 0.5856893760119567, 0.36044934294192454, 0.2379464204868627, 0.18619549755282502, 0.14409246451938135, 0.10345854955312216, 0.0399821557462507, 0.0002454255115474395, -0.03397266927048204, -0.09275731925775, -0.14430502854452312, -0.14430502854452312, -0.21258522056358756, -0.2828921716640679, -0.41486347893929015, -0.41486347893929015, 0.36044934294192454, 0.2379464204868627, 0.18619549755282502, 0.14409246451938135, 0.10345854955312216, 0.06691345227408212, 0.0399821557462507, 0.0002454255115474395, -0.03397266927048204, -0.05782855768018973, -0.09275731925775, -0.14430502854452312, -0.14430502854452312, -0.21258522056358756, -0.2828921716640679, -0.41486347893929015, 0.2379464204868627, 0.14409246451938135, 0.10345854955312216, 0.10345854955312216, 0.06691345227408212, 0.0399821557462507, 0.018906730858427517, 0.0002454255115474395, -0.01513044631792837, -0.03397266927048204, -0.05782855768018973, -0.09275731925775, -0.09275731925775, -0.14430502854452312, -0.14430502854452312, -0.21258522056358756, 0.10345854955312216, 0.06691345227408212, 0.06691345227408212, 0.0399821557462507, 0.0399821557462507, 0.018906730858427517, 0.018906730858427517, 0.0002454255115474395, -0.01513044631792837, -0.01513044631792837, -0.03397266927048204, -0.03397266927048204, -0.05782855768018973, -0.05782855768018973, -0.09275731925775, -0.09275731925775, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, 0.0002454255115474395, -0.09275731925775, -0.05782855768018973, -0.05782855768018973, -0.03397266927048204, -0.03397266927048204, -0.01513044631792837, -0.01513044631792837, 0.0002454255115474395, 0.0002454255115474395, 0.018906730858427517, 0.018906730858427517, 0.0399821557462507, 0.0399821557462507, 0.06691345227408212, 0.06691345227408212, 0.10345854955312216, -0.21258522056358756, -0.14430502854452312, -0.09275731925775, -0.09275731925775, -0.05782855768018973, -0.03397266927048204, -0.01513044631792837, 0.0002454255115474395, 0.018906730858427517, 0.0399821557462507, 0.0399821557462507, 0.06691345227408212, 0.10345854955312216, 0.10345854955312216, 0.14409246451938135, 0.18619549755282502, -0.2828921716640679, -0.21258522056358756, -0.14430502854452312, -0.14430502854452312, -0.09275731925775, -0.05782855768018973, -0.03397266927048204, 0.0002454255115474395, 0.018906730858427517, 0.0399821557462507, 0.06691345227408212, 0.10345854955312216, 0.14409246451938135, 0.18619549755282502, 0.2379464204868627, 0.36044934294192454, -0.41486347893929015, -0.2828921716640679, -0.21258522056358756, -0.14430502854452312, -0.14430502854452312, -0.09275731925775, -0.03397266927048204, 0.0002454255115474395, 0.0399821557462507, 0.06691345227408212, 0.10345854955312216, 0.14409246451938135, 0.18619549755282502, 0.2379464204868627, 0.36044934294192454, 0.36044934294192454, -0.6298858034284472, -0.41486347893929015, -0.2828921716640679, -0.21258522056358756, -0.14430502854452312, -0.09275731925775, -0.05782855768018973, 0.0002454255115474395, 0.0399821557462507, 0.10345854955312216, 0.14409246451938135, 0.18619549755282502, 0.2379464204868627, 0.36044934294192454, 0.36044934294192454, 0.5856893760119567, -0.6298858034284472, -0.41486347893929015, -0.41486347893929015, -0.2828921716640679, -0.21258522056358756, -0.14430502854452312, -0.05782855768018973, 0.0002454255115474395, 0.06691345227408212, 0.10345854955312216, 0.18619549755282502, 0.2379464204868627, 0.36044934294192454, 0.36044934294192454, 0.5856893760119567, 0.5856893760119567, -1.0, -0.6298858034284472, -0.41486347893929015, -0.41486347893929015, -0.2828921716640679, -0.14430502854452312, -0.09275731925775, 0.0002454255115474395, 0.06691345227408212, 0.14409246451938135, 0.2379464204868627, 0.36044934294192454, 0.36044934294192454, 0.5856893760119567, 0.5856893760119567, 1.0, -1.0, -1.0, -0.6298858034284472, -0.41486347893929015, -0.41486347893929015, -0.21258522056358756, -0.09275731925775, 0.0002454255115474395, 0.10345854955312216, 0.18619549755282502, 0.36044934294192454, 0.36044934294192454, 0.5856893760119567, 0.5856893760119567, 1.0, 1.0]
+    
+    lut = torch.tensor(my_lut_256, device="cuda", dtype=torch.float32)
+    set_nf4_ewm_lut_data(lut)
+
     model, tokenizer = load_nf4_model(args.model, args.linear_layer)
     
-    for name, param in model.named_parameters():
-        if torch.isnan(param).any() or torch.isinf(param).any():
-            print(f"{name} contains NaN or inf")
-
     #gen_test(model, tokenizer)
     
     if "all" in args.tasks:

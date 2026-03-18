@@ -65,15 +65,43 @@ def empirical_lloyd_lut(samples: np.ndarray, bits: int = 3) -> dict[int, float]:
     the selected output levels.
     """
     K = 2**bits
-    c, _ = lloyd_max_empirical(samples, K=K)
+    K = 21
+    c, b = lloyd_max_empirical(samples, K=K)
+    print("B:", b)
 
     c = c / np.max(np.abs(c))
     codebook = c
+    print("codebook:", codebook)
 
     lut = {}
-    for i in range(2**bits):
+    for i in range(K):
         lut[i] = codebook[i]
 
+    return lut, b
+
+
+def uniform_quantization_lut(samples: np.ndarray, bits: int = 3) -> dict[int, float]:
+    """
+    Builds a LUT using uniform integer quantization on the range of samples.
+    Divides the [min, max] range into 2^bits uniform bins and normalizes to [-1, 1].
+    """
+    K = 2**bits
+    samples = np.asarray(samples)
+    
+    # Find min and max of samples
+    min_val = samples.min()
+    max_val = samples.max()
+    
+    # Create uniform bins
+    codebook = np.linspace(min_val, max_val, K)
+    
+    # Normalize to [-1, 1]
+    codebook = codebook / np.max(np.abs(codebook))
+    
+    lut = {}
+    for i in range(K):
+        lut[i] = codebook[i]
+    
     return lut
 
 
@@ -98,6 +126,43 @@ def build_nf4_mul_lut(magnitudes: np.ndarray, lut: dict) -> dict[int, float]:
         for j in range(len):
             key = (i << shift) | j
             result[key] = closest_value(magnitudes[i] * magnitudes[j], lut)
+    return result
+
+
+def build_nf4_mul_lut_with_boundaries(
+    magnitudes: np.ndarray,
+    lut: dict,
+    boundaries: np.ndarray,
+) -> dict[int, float]:
+    """
+    Builds a 6-bit NF4 multiplication LUT using explicit bin boundaries.
+
+    boundaries should be a sorted array of length len(lut)+1 that defines the
+    decision thresholds between quantization bins. Each product is assigned to
+    the bin via np.digitize and mapped to the corresponding lut entry.
+    """
+    magnitudes = np.asarray(magnitudes)
+    boundaries = np.asarray(boundaries)
+
+    num_levels = len(lut)
+    if boundaries.shape[0] != num_levels + 1:
+        raise ValueError("boundaries must have length len(lut)+1")
+
+    result = {}
+    length = magnitudes.shape[0]
+    shift = np.log2(length).astype(int)
+
+    # Precompute LUT values in an indexable list to avoid repeated dict lookups.
+    lut_values = [lut[i] for i in range(num_levels)]
+
+    for i in range(length):
+        for j in range(length):
+            key = (i << shift) | j
+            prod = magnitudes[i] * magnitudes[j]
+            idx = np.digitize(prod, boundaries) - 1
+            idx = int(np.clip(idx, 0, num_levels - 1))
+            result[key] = lut_values[idx]
+
     return result
 
 

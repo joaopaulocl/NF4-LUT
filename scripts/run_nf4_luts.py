@@ -16,11 +16,13 @@ from nf4.constants import NF4_MAG
 from nf4.luts import (
     build_mul_lut,
     build_nf4_lut,
+    build_nf4_mul_lut_with_boundaries,
     empirical_lloyd_lut,
     gaussian_max_lloyd_lut,
     nf4_array_multiply,
     build_nf4_mul_lut,
     nf4_matmul,
+    uniform_quantization_lut,
 )
 
 from nf4.products import pairwise_product_matrix, flatten_products
@@ -66,6 +68,7 @@ def main() -> None:
     plt.hist(flattened, bins=30)
     plt.xlabel("Value")
     plt.ylabel("Frequency")
+    plt.ylim(0, 70)
     plt.title("Histogram of NF4 Pairwise Products")
     save_figure(fig, "nf4_products_histogram.png")
 
@@ -73,27 +76,39 @@ def main() -> None:
     plt.hist(unique_vals, bins=30)
     plt.xlabel("Unique Product Value")
     plt.ylabel("Frequency")
+    plt.ylim(0, 70)
     plt.title("Histogram of Unique NF4 Product Values")
     save_figure(fig, "nf4_unique_histogram.png")
 
     lut_nf4 = build_nf4_lut(NF4_MAG)
     lut_8b = build_mul_lut(flattened, bits=8) 
     lut_gaussian = gaussian_max_lloyd_lut(flattened)
-    lut_empirical = empirical_lloyd_lut(flattened, bits=3)
+    lut_empirical, boundaries = empirical_lloyd_lut(flattened, bits=5)
+    lut_uniform = uniform_quantization_lut(flattened, bits=5)
 
-    #print("Empirical LUT values:", lut_empirical)
+    from scipy.stats import shapiro
+
+
+    print("Empirical LUT values:", [float(v) for v in lut_empirical.values()] )
     mul_lut = build_nf4_mul_lut(NF4_MAG, lut_8b)
 
     mul_lut_approx = build_nf4_mul_lut(NF4_MAG, lut_empirical)
+    mul_lut_approx_boundaries = build_nf4_mul_lut_with_boundaries(NF4_MAG, lut_empirical, boundaries)
+    mul_lut_uniform = build_nf4_mul_lut(NF4_MAG, lut_uniform)
 
     #print(mul_lut)
     dump_lut(lut_8b, "lut_8b_accumulator.json")
     dump_lut(lut_gaussian, "lut_3b_gaussian.json")
     dump_lut(lut_empirical, "lut_3b_empirical.json")
+    dump_lut(lut_uniform, "lut_3b_uniform.json")
     dump_lut(mul_lut, "nf4_mul_lut.json")
     dump_lut(mul_lut_approx, "nf4_mul_approx_lut.json")
+    dump_lut(mul_lut_uniform, "nf4_mul_uniform_lut.json")
+    dump_lut(mul_lut_approx_boundaries, "nf4_mul_approx_boundaries_lut.json")
     print("LUT approx", [float(v) for v in mul_lut_approx.values()]) 
-    print("LUT accurate", [float(v) for v in lut_8b.values()]) 
+    print("LUT approx", [float(v) for v in mul_lut_approx_boundaries.values()]) 
+    #print("LUT uniform", [float(v) for v in mul_lut_uniform.values()]) 
+    #print("LUT accurate", [float(v) for v in lut_8b.values()]) 
 
     vals4b = np.arange(16, dtype=np.uint8)
     a = np.repeat(vals4b, 16)

@@ -298,4 +298,4 @@ if __name__ == "__main__":
     #test_main_matmul(128, 128, 128)
     #test_linear_nf4_compute(1024, 128, 64)
     #test3D()
-    test_linear_nf4_compute(64, 64, 64, batch=4, blocksize=64)
+    test_linear_nf4_compute(128, 64, 128, batch=4, blocksize=64)

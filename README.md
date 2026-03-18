@@ -61,7 +61,7 @@ Evaluate PIQA, SIQA, HellaSwag, WinoGrande, ARC (easy/challenge), OpenBookQA, an
 python scripts/run_benchmark_eval.py --model <model-or-path>
 ```
 
-Use `--tasks` to subset (e.g. `--tasks piqa hellaswag`) and `--max-samples` for quicker sanity checks. The script scores each option by log-probability of the answer letter appended after the prompt.
+Use `--tasks` to subset (e.g. `--tasks piqa hellaswag`) and `--max-samples` for quicker sanity checks. The script scores each option by log-probability of the option text appended after the prompt. For PIQA, you can select the LM-Eval-Harness prompt with `--piqa-prompt-style lm_eval`.
 
 Generative tasks (XSum summarization and WMT14 de->en translation) can be run with:
 
@@ -71,4 +71,4 @@ python scripts/run_benchmark_eval.py --model <model-or-path> --tasks xsum wmt14_
 
 Optional generation controls include `--gen-max-new-tokens`, `--gen-do-sample`, `--gen-top-p`, and `--gen-temperature`.
 
-python scripts/run_benchmark_eval.py --model meta-llama/Llama-2-7b-hf --tasks xsum wmt14_de_en --max-samples 50
+python scripts/run_benchmark_eval.py   --model meta-llama/Llama-2-7b-hf   --tasks piqa  --mcq-prompt-style lm_eval --max-samples 100 --linear_layer LinearNF4Compute  
