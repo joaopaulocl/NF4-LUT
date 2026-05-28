@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
@@ -26,6 +29,7 @@ try:
         LinearApproxFP16,
         LinearApproxFP8E4M3,
         LinearApproxFP8E5M2,
+        LinearApproxBfloat16,
     )
 except ImportError:
     from bitsandbytes.nn import Linear4bit
@@ -35,8 +39,9 @@ except ImportError:
     LinearApproxFP16 = None
     LinearApproxFP8E4M3 = None
     LinearApproxFP8E5M2 = None
+    LinearApproxBfloat16 = None
 
-from bitsandbytes.functional import set_nf4_ewm_lut, set_nf4_ewm_lut_data
+from bitsandbytes.functional import set_nf4_ewm_lut, set_nf4_ewm_lut_data, set_prim8_lut
 
 @dataclass
 class TaskSpec:
@@ -205,6 +210,47 @@ def wmt14_de_en_builder(example: dict) -> tuple[str, str]:
     return prompt, target
 
 
+def gsm8k_builder(example: dict) -> tuple[str, str]:
+    prompt = (
+        "Solve the following math problem step by step.\n"
+        f"Problem: {example['question']}\n"
+        "Solution:"
+    )
+    match = re.search(r"####\s*([\d,.\-]+)", example["answer"])
+    gold = match.group(1).replace(",", "").strip() if match else example["answer"].strip()
+    return prompt, gold
+
+
+def humaneval_builder(example: dict) -> tuple[str, str, str]:
+    return example["prompt"], example["test"], example["entry_point"]
+
+
+def extract_gsm8k_answer(text: str) -> str | None:
+    match = re.search(r"####\s*([\d,.\-]+)", text)
+    if match:
+        return match.group(1).replace(",", "").strip()
+    numbers = re.findall(r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?", text)
+    return numbers[-1].replace(",", "") if numbers else None
+
+
+def check_humaneval_correctness(completion: str, test_code: str, entry_point: str, timeout: int = 10) -> bool:
+    code = completion + "\n\n" + test_code + f"\n\ncheck({entry_point})\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(code)
+        tmpfile = f.name
+    try:
+        result = subprocess.run(
+            ["python3", tmpfile],
+            capture_output=True,
+            timeout=timeout,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    finally:
+        os.unlink(tmpfile)
+
+
 TASK_SPECS: dict[str, TaskSpec] = {
     "piqa": TaskSpec(
         dataset="piqa",
@@ -272,6 +318,31 @@ TASK_SPECS: dict[str, TaskSpec] = {
         task_type="gen",
         metric="bleu",
     ),
+    "gsm8k": TaskSpec(
+        dataset="openai/gsm8k",
+        config="main",
+        split="test",
+        builder=gsm8k_builder,
+        task_type="gen",
+        metric="exact_match",
+    ),
+    "humaneval": TaskSpec(
+        dataset="openai_humaneval",
+        config=None,
+        split="test",
+        builder=humaneval_builder,
+        task_type="code_eval",
+        metric="pass@1",
+    ),
+}
+
+dtype_map = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
 }
 
 def build_parser() -> argparse.ArgumentParser:
@@ -297,6 +368,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on the number of examples per task.",
     )
     parser.add_argument(
+        "--load-dtype",
+        type=str,
+        choices=dtype_map.keys(),
+        default="fp16",
+        help="How the weights are stored during inference (not training dtype).",
+    )
+    parser.add_argument(
         "--lut-size",
         type=int,
         choices=[3, 4, 5, 6, 7, 8],
@@ -314,13 +392,28 @@ def build_parser() -> argparse.ArgumentParser:
             "LinearApproxFP16",
             "LinearApproxFP8E4M3",
             "LinearApproxFP8E5M2",
+            "LinearApproxBfloat16",
         ],
         default="Linear4bit",
         help=(
             "Type of linear layer to use for the model. "
             "LinearApprox* variants replace nn.Linear with approximate-matmul layers "
             "without any weight quantization. "
-            "FP8 variants cast weights from the loaded FP16 checkpoint."
+            "FP8 variants cast weights from the loaded FP16 checkpoint. "
+            "LinearApproxBfloat16 uses the PRIM8 LUT-based BF16 approximate kernel."
+        ),
+    )
+    parser.add_argument(
+        "--prim8-lut",
+        choices=[
+            "44R0", "55R0", "66R0", "77R0", "88R0", "99R0", "aaR0",
+            "44R12", "55R12", "66R12", "77R12", "88R12", "99R12", "aaR12",
+        ],
+        default="aaR0",
+        help=(
+            "PRIM8 LUT variant to upload to the GPU when using LinearApproxBfloat16. "
+            "Format: <rounding><R-variant> where rounding ∈ {44,55,66,77,88,99,aa} "
+            "and variant ∈ {R0, R12}. Default: aaR0."
         ),
     )
     parser.add_argument(
@@ -371,6 +464,7 @@ _APPROX_LAYER_CLASSES = {
     "LinearApproxFP16": LinearApproxFP16,
     "LinearApproxFP8E4M3": LinearApproxFP8E4M3,
     "LinearApproxFP8E5M2": LinearApproxFP8E5M2,
+    "LinearApproxBfloat16": LinearApproxBfloat16,
 }
 
 # Load dtype for each approx variant.
@@ -381,6 +475,13 @@ _APPROX_LOAD_DTYPE = {
     "LinearApproxFP16": torch.float16,
     "LinearApproxFP8E4M3": torch.float16,
     "LinearApproxFP8E5M2": torch.float16,
+    "LinearApproxBfloat16": torch.bfloat16,
+}
+
+# PRIM8 LUT name → id mapping (matches set_prim8_lut() in ops.cu)
+_PRIM8_LUT_IDS = {
+    "44R0": 0, "55R0": 1, "66R0": 2, "77R0": 3, "88R0": 4, "99R0": 5, "aaR0": 6,
+    "44R12": 7, "55R12": 8, "66R12": 9, "77R12": 10, "88R12": 11, "99R12": 12, "aaR12": 13,
 }
 
 
@@ -396,11 +497,13 @@ def replace_linear_with_approx(module: nn.Module, layer_cls: type) -> None:
             device = child.weight.device
             new_layer = layer_cls(child.in_features, child.out_features, bias=child.bias is not None)
             with torch.no_grad():
-                # weight may be an nn.Parameter or a buffer (FP8 case)
+                # weight may be an nn.Parameter or a buffer (FP8 case).
+                # Pull to CPU first to avoid cross-device FP8 copy issues.
                 tgt_dtype = new_layer.weight.dtype
-                new_layer.weight.copy_(child.weight.data.to(tgt_dtype))
+                src = child.weight.data.cpu().to(tgt_dtype)
+                new_layer.weight.copy_(src)
                 if child.bias is not None:
-                    new_layer.bias.data.copy_(child.bias.data)
+                    new_layer.bias.data.copy_(child.bias.data.cpu())
             new_layer = new_layer.to(device)
             setattr(module, name, new_layer)
         else:
@@ -469,7 +572,23 @@ def replace_linear_with_fake(module):
             replace_linear_with_fake(child)
 
 
-def load_nf4_model(model_id: str, linear_layer: str):
+_MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
+
+
+def _resolve_model_path(model_id: str) -> str:
+    """Return a local path under models/ if available, otherwise return model_id as-is."""
+    candidate = os.path.normpath(os.path.join(_MODELS_DIR, model_id))
+    if os.path.isdir(candidate):
+        return candidate
+    # Also try just the model name without the org prefix (e.g. "meta-llama/Llama-2-7b" -> "Llama-2-7b")
+    short_name = model_id.split("/")[-1]
+    candidate_short = os.path.normpath(os.path.join(_MODELS_DIR, short_name))
+    if os.path.isdir(candidate_short):
+        return candidate_short
+    return model_id
+
+
+def load_nf4_model(model_id: str, linear_layer: str, prim8_lut: str = "aaR0", load_dtype = torch.float16):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -480,23 +599,23 @@ def load_nf4_model(model_id: str, linear_layer: str):
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=load_dtype,
         )
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, device_map="auto", quantization_config=quant_config
+            model_id, device_map="cuda", quantization_config=quant_config
         )
         model.eval()
     elif linear_layer == "Linear4bitFakeQuantAct":
         # Start from a plain FP16 model, then replace nn.Linear layers.
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, dtype=torch.float16, device_map="auto"
+            model_id, dtype=load_dtype, device_map="cuda"
         )
         model.eval()
         replace_linear_with_fake(model)
         model.eval()
     elif linear_layer == "LinearNF4Compute":
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, dtype=torch.float16, device_map="auto"
+            model_id, dtype=load_dtype, device_map="cuda"
         )
         model.eval()
         fp_state = model.state_dict()
@@ -509,7 +628,7 @@ def load_nf4_model(model_id: str, linear_layer: str):
                         child.in_features,
                         child.out_features,
                         bias=child.bias is not None,
-                        compute_dtype=torch.float16,
+                        compute_dtype=load_dtype,
                         compress_statistics=False,
                         #quant_storage=child.quant_storage,
                         device=child.weight.device,
@@ -544,15 +663,18 @@ def load_nf4_model(model_id: str, linear_layer: str):
         layer_cls = _APPROX_LAYER_CLASSES[linear_layer]
         load_dtype = _APPROX_LOAD_DTYPE[linear_layer]
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=load_dtype, device_map="auto"
+            model_id, torch_dtype=load_dtype, device_map="cuda"
         )
         model.eval()
+        if linear_layer == "LinearApproxBfloat16":
+            lut_id = _PRIM8_LUT_IDS[prim8_lut]
+            set_prim8_lut(lut_id)
         replace_linear_with_approx(model, layer_cls)
         model.eval()
 
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, dtype=torch.float16, device_map="cuda"
+            model_id, dtype=load_dtype, device_map="cuda"
         )
 
     return model, tokenizer
@@ -718,20 +840,28 @@ def compute_bleu(stats: dict[str, list[int] | int]) -> float:
     return bleu
 
 
-def generate_completion(model, tokenizer, prompt: str, args: argparse.Namespace) -> str:
+def generate_completion(
+    model,
+    tokenizer,
+    prompt: str,
+    args: argparse.Namespace,
+    max_new_tokens: int | None = None,
+    strip: bool = True,
+) -> str:
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     prompt_len = inputs["input_ids"].shape[1]
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=args.gen_max_new_tokens,
+            max_new_tokens=max_new_tokens if max_new_tokens is not None else args.gen_max_new_tokens,
             do_sample=args.gen_do_sample,
             top_p=args.gen_top_p,
             temperature=args.gen_temperature,
             pad_token_id=tokenizer.eos_token_id,
         )
     gen_ids = outputs[0][prompt_len:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    return text.strip() if strip else text
 
 
 def evaluate_gen_task(
@@ -772,6 +902,18 @@ def evaluate_gen_task(
         print(f"{name} BLEU: {score * 100:.2f}")
         return score
 
+    if spec.metric == "exact_match":
+        correct = 0
+        for example in iterator:
+            prompt, gold = spec.builder(example)
+            hypothesis = generate_completion(model, tokenizer, prompt, args)
+            pred = extract_gsm8k_answer(hypothesis)
+            if pred is not None and pred == gold:
+                correct += 1
+        acc = correct / total if total else 0.0
+        print(f"{name} Exact-Match: {acc * 100:.2f}% ({correct}/{total})")
+        return acc
+
     total_score = 0.0
     for example in iterator:
         prompt, references = spec.builder(example)
@@ -782,6 +924,44 @@ def evaluate_gen_task(
     avg_score = total_score / total if total else 0.0
     print(f"{name} ROUGE-L: {avg_score * 100:.2f}")
     return avg_score
+
+
+def evaluate_code_task(
+    name: str,
+    spec: TaskSpec,
+    model,
+    tokenizer,
+    max_samples: int | None,
+    args: argparse.Namespace,
+) -> float:
+    dataset = load_dataset(
+        spec.dataset,
+        spec.config,
+        split=spec.split,
+        trust_remote_code=spec.trust_remote_code,
+    )
+    total = len(dataset)
+    if max_samples is not None:
+        total = min(total, max_samples)
+        dataset = dataset.select(range(total))
+
+    code_max_tokens = max(args.gen_max_new_tokens, 512)
+    passed = 0
+    iterator: Iterable[dict] = tqdm(dataset, desc=name, unit="ex")
+    for example in iterator:
+        prompt, test_code, entry_point = spec.builder(example)
+        completion = generate_completion(
+            model, tokenizer, prompt, args,
+            max_new_tokens=code_max_tokens,
+            strip=False,
+        )
+        full_completion = prompt + completion
+        if check_humaneval_correctness(full_completion, test_code, entry_point):
+            passed += 1
+
+    pass_at_1 = passed / total if total else 0.0
+    print(f"{name} pass@1: {pass_at_1 * 100:.2f}% ({passed}/{total})")
+    return pass_at_1
 
 
 def gen_test(model, tokenizer):
@@ -826,7 +1006,7 @@ def main() -> None:
     lut = torch.tensor(my_lut_256, device="cuda", dtype=torch.float32)
     set_nf4_ewm_lut_data(lut)
 
-    model, tokenizer = load_nf4_model(args.model, args.linear_layer)
+    model, tokenizer = load_nf4_model(args.model, args.linear_layer, args.prim8_lut, dtype_map[args.load_dtype])
     
     #gen_test(model, tokenizer)
     
@@ -847,6 +1027,15 @@ def main() -> None:
                 args.max_samples,
                 args,
             )
+        elif spec.task_type == "code_eval":
+            score = evaluate_code_task(
+                task_name,
+                spec,
+                model,
+                tokenizer,
+                args.max_samples,
+                args,
+            )
         else:
             score = evaluate_task(task_name, spec, model, tokenizer, args.max_samples)
         results[task_name] = score
@@ -859,6 +1048,10 @@ def main() -> None:
             print(f"- {task_name}: {score * 100:.2f}%")
         elif spec.metric == "bleu":
             print(f"- {task_name} (BLEU): {score * 100:.2f}")
+        elif spec.metric == "exact_match":
+            print(f"- {task_name} (Exact-Match): {score * 100:.2f}%")
+        elif spec.metric == "pass@1":
+            print(f"- {task_name} (pass@1): {score * 100:.2f}%")
         else:
             print(f"- {task_name} (ROUGE-L): {score * 100:.2f}")
 
