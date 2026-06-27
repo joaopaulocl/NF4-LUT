@@ -40,8 +40,39 @@ LM_EVAL_TASKS: dict[str, str] = {
     "humaneval":      "humaneval",
     "xsum":           "xsum",
     "wmt14_de_en":    "wmt14-de-en",
-    "mmlu":           "mmlu"
+    "mmlu":           "mmlu",
+    "mgsm_native_cot_en": "mgsm_native_cot_en",
+    "mgsm_native_cot_de": "mgsm_native_cot_de",
+    "mgsm_native_cot_es": "mgsm_native_cot_es",
+    "mgsm_native_cot_fr": "mgsm_native_cot_fr",
+    "mgsm_native_cot_ja": "mgsm_native_cot_ja",
+    "mgsm_native_cot_zh": "mgsm_native_cot_zh",
+    "mgsm_native_cot_ru": "mgsm_native_cot_ru",
+    "mgsm_native_cot_bn": "mgsm_native_cot_bn",
+    "mgsm_native_cot_sw": "mgsm_native_cot_sw",
+    "mgsm_native_cot_te": "mgsm_native_cot_te",
+    "mgsm_native_cot_th": "mgsm_native_cot_th",
 }
+
+# Per-task few-shot defaults from the Llama 3.1 evaluation table.
+# Tasks not listed default to 0.
+TASK_FEWSHOT: dict[str, int] = {
+    "mmlu":                5,
+    "gsm8k_cot":           8,
+    "mgsm_native_cot_en":  8,
+    "mgsm_native_cot_de":  8,
+    "mgsm_native_cot_es":  8,
+    "mgsm_native_cot_fr":  8,
+    "mgsm_native_cot_ja":  8,
+    "mgsm_native_cot_zh":  8,
+    "mgsm_native_cot_ru":  8,
+    "mgsm_native_cot_bn":  8,
+    "mgsm_native_cot_sw":  8,
+    "mgsm_native_cot_te":  8,
+    "mgsm_native_cot_th":  8,
+}
+
+# https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/llama-3_1-8b-instruct-nemo?version=2.0
 
 ALL_TASKS = list(LM_EVAL_TASKS.keys())
 
@@ -55,8 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tasks", nargs="+",
                         choices=["all", *ALL_TASKS], default=["all"],
                         help="Tasks to run (default: all).")
-    parser.add_argument("--num-fewshot", type=int, default=0,
-                        help="Number of few-shot examples (default: 0).")
+    parser.add_argument("--num-fewshot", type=int, default=None,
+                        help="Number of few-shot examples. Overrides per-task defaults when set.")
     parser.add_argument("--batch-size", default="auto",
                         help="Batch size passed to lm-eval (default: auto).")
     parser.add_argument("--max-samples", type=int, default=None,
@@ -129,14 +160,28 @@ def main() -> None:
 
     lm_eval_task_names = [LM_EVAL_TASKS[t] for t in local_names]
 
-    # --- Run evaluation ---
-    results = simple_evaluate(
-        model=lm,
-        tasks=lm_eval_task_names,
-        limit=args.max_samples,
-        log_samples=False,
-        confirm_run_unsafe_code=True
-    )
+    # --- Run evaluation (group by few-shot count so each group uses the right value) ---
+    from collections import defaultdict
+    groups: dict[int, list[tuple[str, str]]] = defaultdict(list)
+    for local, lm_name in zip(local_names, lm_eval_task_names):
+        n = args.num_fewshot if args.num_fewshot is not None else TASK_FEWSHOT.get(local, 0)
+        groups[n].append((local, lm_name))
+
+    all_task_results: dict[str, dict] = {}
+    for n_shots, task_pairs in sorted(groups.items()):
+        group_lm_names = [lm_name for _, lm_name in task_pairs]
+        r = simple_evaluate(
+            model=lm,
+            tasks=group_lm_names,
+            num_fewshot=n_shots,
+            limit=args.max_samples,
+            log_samples=False,
+            confirm_run_unsafe_code=True,
+        )
+        all_task_results.update(r.get("results", {}))
+        if "results" in r:
+            r["results"] = all_task_results
+        results = r
 
     # --- Print summary ---
     print("\nSummary:")
@@ -144,7 +189,8 @@ def main() -> None:
     for local_name, lm_name in zip(local_names, lm_eval_task_names):
         r = task_results.get(lm_name, {})
         # lm-eval stores metrics as "metric,aggregation" keys, e.g. "acc,none"
-        acc = r.get("acc,none") or r.get("acc_norm,none") or r.get("exact_match,none")
+        #acc = r.get("acc,none") or r.get("acc_norm,none") or r.get("exact_match,none")
+        acc = r.get("acc_char,none") or r.get("acc_norm,none") or r.get("acc,none") or r.get("exact_match,none")
         if acc is not None:
             print(f"  {local_name:20s}: {acc * 100:.2f}%")
         else:
